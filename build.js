@@ -29,7 +29,7 @@ const staticFile =
   '<meta charset="utf-8">\n' +
   '<meta name="viewport" content="width=device-width, initial-scale=1">\n' +
   '<meta name="description" content="Classificação da pelada — mescla toda semana.">\n' +
-  "<title>Racha 2026</title>\n" +
+  "<title>FUT QUARTA 2026</title>\n" +
   googleFontsLink +
   "<style>\n" + cssText + "\n</style>\n" +
   "</head>\n<body>\n" +
