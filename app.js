@@ -12,6 +12,132 @@ var READ_ONLY = false;
 var ARTIFACT_NS = null;
 var DOWNLOADS_NS = null;
 
+/* ---------- remote persistence (Supabase) ----------
+   The anon/publishable key below is meant to be public — it only lets the
+   browser call the two RPC functions and read the public state row.
+   Reads are open to anyone (RLS policy). Writes only succeed inside
+   racha_save() on the database side, which checks the admin password
+   against a bcrypt hash stored server-side — the key itself grants no
+   write access on its own. */
+var SUPABASE_URL = "https://eegvtaurankwpbmwgfzn.supabase.co";
+var SUPABASE_ANON_KEY = "sb_publishable_OqSAORfD3eaNSOhA4kYlNQ_p42jN62t";
+var ADMIN_PW_STORAGE_KEY = "racha_admin_pw";
+var ADMIN_PW = null;
+var REMOTE_OK = false;
+
+function supabaseHeaders(extra) {
+  var h = { apikey: SUPABASE_ANON_KEY, Authorization: "Bearer " + SUPABASE_ANON_KEY };
+  if (extra) for (var k in extra) h[k] = extra[k];
+  return h;
+}
+
+async function fetchRemoteState() {
+  try {
+    var res = await fetch(SUPABASE_URL + "/rest/v1/racha_state?select=data,updated_at&id=eq.1", {
+      headers: supabaseHeaders()
+    });
+    if (!res.ok) return null;
+    var rows = await res.json();
+    if (!rows || !rows.length) return null;
+    return rows[0];
+  } catch (e) {
+    return null;
+  }
+}
+
+async function remoteLogin(pw) {
+  try {
+    var res = await fetch(SUPABASE_URL + "/rest/v1/rpc/racha_login", {
+      method: "POST",
+      headers: supabaseHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ pw: pw })
+    });
+    if (!res.ok) return false;
+    var ok = await res.json();
+    return ok === true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function remoteSave(pw, data) {
+  try {
+    var res = await fetch(SUPABASE_URL + "/rest/v1/rpc/racha_save", {
+      method: "POST",
+      headers: supabaseHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ pw: pw, new_data: data })
+    });
+    if (!res.ok) return false;
+    var ok = await res.json();
+    return ok === true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function isoToLabel(iso) {
+  try {
+    return new Date(iso).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
+  } catch (e) {
+    return null;
+  }
+}
+
+function openLoginModal() {
+  var slot = document.getElementById("modal-slot");
+  if (!slot) return;
+  slot.innerHTML =
+    '<div class="modal-backdrop" id="modal-backdrop"><div class="modal"><h3>Entrar como admin</h3>' +
+    '<div class="field"><label for="admin-pw">Senha</label><input id="admin-pw" type="password" autocomplete="current-password"></div>' +
+    '<div class="modal-actions"><button type="button" class="btn btn-sm" id="modal-cancel">Cancelar</button><button type="button" class="btn btn-sm btn-accent" id="modal-confirm">Entrar</button></div>' +
+    "</div></div>";
+
+  function close() { slot.innerHTML = ""; }
+
+  document.getElementById("modal-backdrop").addEventListener("click", function (e) {
+    if (e.target.id === "modal-backdrop") close();
+  });
+  document.getElementById("modal-cancel").addEventListener("click", close);
+
+  var pwInput = document.getElementById("admin-pw");
+  if (pwInput) pwInput.focus();
+
+  function attempt() {
+    var pw = pwInput ? pwInput.value : "";
+    if (!pw) return;
+    var btn = document.getElementById("modal-confirm");
+    if (btn) { btn.disabled = true; btn.textContent = "Entrando..."; }
+    remoteLogin(pw).then(function (ok) {
+      if (ok) {
+        ADMIN_PW = pw;
+        try { localStorage.setItem(ADMIN_PW_STORAGE_KEY, pw); } catch (e) {}
+        READ_ONLY = false;
+        close();
+        renderAll();
+      } else {
+        if (btn) { btn.disabled = false; btn.textContent = "Entrar"; }
+        showToast("Senha incorreta.");
+      }
+    });
+  }
+
+  document.getElementById("modal-confirm").addEventListener("click", attempt);
+  if (pwInput) {
+    pwInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") attempt();
+    });
+  }
+}
+
+function logoutAdmin() {
+  ADMIN_PW = null;
+  try { localStorage.removeItem(ADMIN_PW_STORAGE_KEY); } catch (e) {}
+  READ_ONLY = true;
+  EDIT_MODE = false;
+  DIRTY = false;
+  renderAll();
+}
+
 var CODES = [
   { v: 3, key: "v", label: "V", name: "Vitória" },
   { v: 2, key: "e", label: "E", name: "Empate" },
@@ -253,19 +379,25 @@ function renderToolbar() {
       '<button type="button" class="btn btn-sm btn-ghost" id="btn-backup-json">Backup</button>'
     : "";
 
+  var loginBtn = REMOTE_OK ? '<button type="button" class="btn btn-sm btn-ghost" id="btn-admin-login">Entrar</button>' : "";
+  var logoutBtn = '<button type="button" class="btn btn-sm btn-ghost" id="btn-admin-logout">Sair</button>';
+
   if (READ_ONLY) {
-    right.innerHTML = downloadBtns;
+    right.innerHTML = downloadBtns + loginBtn;
     bind("btn-export-csv", "click", exportCsv);
     bind("btn-backup-json", "click", exportJsonBackup);
+    bind("btn-admin-login", "click", openLoginModal);
     return;
   }
 
   if (!EDIT_MODE) {
     right.innerHTML =
       downloadBtns +
+      logoutBtn +
       '<button type="button" class="btn" id="btn-enter-edit">' + pencilSvg() + " Editar</button>";
     var b = document.getElementById("btn-enter-edit");
     if (b) b.addEventListener("click", function () { EDIT_MODE = true; renderAll(); });
+    bind("btn-admin-logout", "click", logoutAdmin);
   } else {
     right.innerHTML = downloadBtns;
   }
@@ -1431,11 +1563,31 @@ function todayLabel() {
 
 async function saveEdit() {
   if (!DIRTY) { EDIT_MODE = false; renderAll(); return; }
-  STATE.updatedAt = todayLabel();
+  var newUpdatedAt = todayLabel();
+
+  if (REMOTE_OK && ADMIN_PW) {
+    var ok = await remoteSave(ADMIN_PW, STATE.data);
+    if (ok) {
+      STATE.updatedAt = newUpdatedAt;
+      EDIT_MODE = false;
+      DIRTY = false;
+      showToast("Salvo! Já está no ar pra todo mundo.");
+      renderAll();
+    } else {
+      showToast("Não consegui salvar — sua sessão pode ter expirado. Entra de novo.");
+      logoutAdmin();
+    }
+    return;
+  }
+
+  /* Legacy fallback: when this page is opened as a Claude Artifact
+     (window.claude present) instead of the deployed site, publishing a
+     new version is the only way to persist. Not used on the live site. */
+  STATE.updatedAt = newUpdatedAt;
   var html = buildStandaloneHTML(STATE);
 
   if (!ARTIFACT_NS) {
-    showToast("Não foi possível salvar por aqui — abra este Racha como artifact publicado.");
+    showToast("Não foi possível salvar — sem conexão com o banco de dados.");
     return;
   }
   try {
@@ -1463,13 +1615,32 @@ async function saveEdit() {
 
 async function boot(seedState) {
   STATE = seedState;
-  if (!(window.claude && typeof window.claude.use === "function")) {
-    /* No Claude runtime available (e.g. a plain static hosting like
-       Vercel) — there is no way to publish edits from the browser here,
-       so the page is view-only. Editing happens by regenerating and
-       redeploying the site. */
-    READ_ONLY = true;
-  }
+  READ_ONLY = true;
+
+  try {
+    var remote = await fetchRemoteState();
+    if (remote) {
+      STATE = {
+        updatedAt: remote.updated_at ? isoToLabel(remote.updated_at) : STATE.updatedAt,
+        data: remote.data
+      };
+      REMOTE_OK = true;
+    }
+  } catch (e) {}
+
+  try {
+    var savedPw = localStorage.getItem(ADMIN_PW_STORAGE_KEY);
+    if (savedPw) {
+      var loggedIn = await remoteLogin(savedPw);
+      if (loggedIn) {
+        ADMIN_PW = savedPw;
+        READ_ONLY = false;
+      } else {
+        localStorage.removeItem(ADMIN_PW_STORAGE_KEY);
+      }
+    }
+  } catch (e) {}
+
   renderAll();
 
   document.addEventListener(
